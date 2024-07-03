@@ -28,23 +28,32 @@ renv::activate()
 ```{r prepareEnvironment2}
 
 packages <- c('xts', 'forecast', 'zoo',
-            'fable','fabletools','tsibble','tidymodels', 'feasts')
+            'fabletools','tsibble','tidymodels', 
+            'feasts')
 
 # Function to install and load packages if not already installed
 installAndLoadPackages <- function(pkg) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
-    install.packages(pkg)
+    install.packages(pkg, dependencies = TRUE)
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      warning(paste("Package", pkg, "could not be installed."))
+    } else {
+      library(pkg, character.only = TRUE)
+    }
+  } else {
     library(pkg, character.only = TRUE)
   }
 }
 
+# Loop through packages and install/load them
 for (pkg in packages) {
   installAndLoadPackages(pkg)
 }
 
-# caret fails to load for unknown reason
-library(caret)
-renv::snapshot()
+# After installing/loading, snapshot the environment if using renv
+if (requireNamespace("renv", quietly = TRUE)) {
+  renv::snapshot()
+}
 
 # Set global options
 options(stringsAsFactors = FALSE) # Prevent automatic conversion of strings to factors
