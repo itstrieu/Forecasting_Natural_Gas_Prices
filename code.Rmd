@@ -1,0 +1,248 @@
+---
+title: "Forecasting Natural Gas Prices"
+author: "Kathy Trieu"
+date: "June 2024"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+header-includes: 
+- \usepackage{float}
+---
+
+# Introduction
+
+```{r prepareEnvironment, include=FALSE}
+if(!require(renv)) install.packages("renv")
+
+# Initialize 'renv' if the lock file does not exist
+if (!file.exists("renv.lock")) {
+  renv::init()
+}
+
+renv::activate()
+
+```
+
+
+```{r prepareEnvironment2}
+
+packages <- c('xts', 'forecast', 'zoo',
+            'fable','fabletools','tsibble','tidymodels', 'feasts')
+
+# Function to install and load packages if not already installed
+installAndLoadPackages <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+for (pkg in packages) {
+  installAndLoadPackages(pkg)
+}
+
+# caret fails to load for unknown reason
+library(caret)
+renv::snapshot()
+
+# Set global options
+options(stringsAsFactors = FALSE) # Prevent automatic conversion of strings to factors
+options(scipen = 999) # Turn off scientific notation for numbers
+
+# Set custom RStudio settings when an interactive session is initiated
+if (interactive()) {
+  setHook("rstudio.sessionInit", function(newSession) {
+    if (newSession) {
+      # Arrange the RStudio layout and clear the console
+      rstudioapi::executeCommand("layoutDebugConsole")
+      rstudioapi::executeCommand("consoleClear")
+    }
+  })
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,    # Display code in the output
+  warning = FALSE, # Suppress warnings in the output
+  message = FALSE  # Suppress messages in the output
+)
+
+```
+
+# Untransformed Data 
+
+```{r ReadData}
+rawGasData = read.csv("Henry_Hub_Natural_Gas_Spot_Price_Monthly.csv")
+dollarsTimeSeries = ts(rev(rawGasData$Dollars), frequency=12, start=1997) 
+
+time_index <- as.yearmon(time(dollarsTimeSeries))
+data <- xts(coredata(dollarsTimeSeries), order.by=time_index, frequency = frequency(dollarsTimeSeries))
+data_df <- as.data.frame(data)
+data_df$yearmonth <- as.yearmon(zoo::index(data))
+
+library(tsibble)
+data_df$yearmonth <- yearmonth(data_df$yearmonth)
+data_tb <- tsibble::as_tsibble(data_df, key = NULL) %>%
+  dplyr::mutate(
+    month = yearmonth,
+    price = V1,
+    log = log(price),.keep="unused") %>%
+  as_tsibble(index = month) 
+
+data_df <- as.data.frame(data_tb)
+
+plot(as.xts(dollarsTimeSeries),
+     major.format="%m-%Y",
+     main="Henry Hub Gas Spot Prices - Monthly Average",
+     ylab="Dollars per Million Btu")
+```
+
+
+## Fitting an ARMA Model 
+
+```{r}
+h <- 36
+```
+
+
+```{r}
+training <- data_tb |> filter_index(~ "2021-05")
+test <- data_tb |> filter_index("2021-06" ~ .)
+train_data <- training$log
+actual_values <- data_tb
+```
+```{r}
+data_tb |> 
+  gg_tsdisplay(difference(log(price), 12) |> difference(),
+                        plot_type='partial', lag=h) +
+  labs(title = "Seasonally Double Differenced (Log)", y="") 
+
+```
+
+```{r}
+is_invertible <- function(model) {
+  ar_roots <- abs(polyroot(c(1, -model$coef[grepl("ar", names(model$coef))])))
+  ma_roots <- abs(polyroot(c(1, model$coef[grepl("ma", names(model$coef))])))
+  sar_roots <- abs(polyroot(c(1, -model$coef[grepl("sar", names(model$coef))])))  
+  sma_roots <- abs(polyroot(c(1, model$coef[grepl("sma", names(model$coef))]))) 
+  
+  all(ar_roots > 1) && all(ma_roots > 1) && all(sar_roots > 1) && all(sma_roots > 1)
+}
+
+best_model <- NULL
+best_aic <- Inf
+next_best <- NULL
+max_p <- 3
+max_q <- 3
+max_d <- 1
+max_D <- 2
+max_P <- 2
+max_Q <- 2
+M=12
+
+suppressWarnings({
+for (p in 0:max_p) {
+  for (d in 0:max_d) { 
+    for (q in 0:max_q) {
+      for (P in 0:max_P) {
+        for (D in 0:max_D) {
+          for (Q in 0:max_Q) {
+            tryCatch({
+              model <- Arima(train_data, order=c(p, d, q), 
+                             seasonal=list(order=c(P, D, Q), period=M),
+                             include.drift=TRUE, include.mean=TRUE)
+
+              if (is_invertible(model)) {
+                aic <- AIC(model)
+                if (aic < -140) {
+                  cat(p, d, q, P, D, Q, M, aic, "\n")
+                  if (aic < best_aic) {
+                    next_best <- best_model
+                    best_model <- model
+                    best_aic <- aic
+                    
+                  }
+                }
+              }
+            }, error = function(e) {
+              # Ignore errors silently
+              invisible(NULL)
+            })
+          }
+        }
+      }
+    }
+  }
+}})
+print("Best Model:")
+print(best_model)
+print("AIC:")
+print(best_aic)
+```
+
+```{r}
+
+fit <- training |>
+  model(
+    arima302100 = ARIMA(log(price) ~ 1 + pdq(3,0,2) + PDQ(1,0,0)),
+    arima100000 = ARIMA(log(price) ~ 1 + pdq(1,0,0) + PDQ(0,0,0)),
+    autoarima = ARIMA(log(price), stepwise=FALSE, approx=FALSE)
+    )
+```
+
+
+```{r}
+fit |> pivot_longer(everything(), names_to = "Model Name", 
+                    values_to = "Orders")
+
+glance(fit) |> arrange(AICc) |> select(.model:BIC)
+
+fit |> select(autoarima) |> gg_tsresiduals() + labs(title="autoarima")
+fit |> select(arima100000) |> gg_tsresiduals() + labs(title="arima100000")
+fit |> select(arima302100) |> gg_tsresiduals() + labs(title="arima302100")
+
+augment(fit) |>
+  features(.innov, ljung_box, lag=24, dof=3)
+
+fit |>
+  forecast(h=h) |>
+  accuracy(data_tb)
+
+  
+fit |>
+  forecast(h=h)|>
+  autoplot(data_tb)
+
+
+fit |>
+  forecast(h=h)|>
+  autoplot(data_tb, level=80) + 
+  theme_minimal() +
+  coord_cartesian(xlim = c(as.Date("2020-01-01"), as.Date("2024-01-01")))
+  
+fit |>
+  forecast(h=h)|>
+  autoplot(data_tb, level=c()) + 
+  theme_minimal() +
+  coord_cartesian(xlim = c(as.Date("2020-01-01"), as.Date("2024-01-01")))
+```
+
+
+
+```{r}
+
+fits12 <- fitted(fit, h=2) 
+
+training |> 
+  autoplot(price) +
+  autolayer(fits12, .fitted) + 
+  labs(title = "Henry Hub Gas Spot Prices",
+       y="Price")
+
+# trouble with quantity of data 
+fit |>
+  select(-arima302100) |>
+  fabletools::refit(test) |>
+  accuracy()
+
+```
